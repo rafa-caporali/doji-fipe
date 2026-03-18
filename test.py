@@ -7,6 +7,8 @@ from definitions import fetch_sheet_data
 from definitions import build_offer_row_list_from_sheet_df, extract_unique_offer_keys
 from definitions import build_query, load_config
 from definitions import fetch_BQ_engagement_data
+from definitions import calculate_new_price_from_history
+from definitions import send_prices_to_sheets
 
 
 def main() -> None:
@@ -63,6 +65,26 @@ def main() -> None:
         print("bq rows:", len(bq_df))
         print("bq cols:", list(bq_df.columns))
         print(bq_df.head(5))
+
+        priced_rows = calculate_new_price_from_history(
+            offer_rows=offer_rows,
+            bq_df=bq_df,
+        )
+        print("priced rows:", len(priced_rows))
+        print("priced sample:", priced_rows[:5])
+
+        # Optional: append to output sheet if requested.
+        if os.environ.get("RUN_SHEETS", "").strip() == "1":
+            out_cfg = cfg.get("output_sheets", {})
+            resp = send_prices_to_sheets(
+                spreadsheet_id=out_cfg.get(
+                    "spreadsheet_id",
+                    "146U6ZWg2Fxmp2VRkzMidm48J6m68trfW9-3hOVGVFkg",
+                ),
+                sheet_name=out_cfg.get("sheet_name", "price_tweak"),
+                rows=priced_rows,
+            )
+            print("sheets append:", resp)
 
 
 if __name__ == "__main__":

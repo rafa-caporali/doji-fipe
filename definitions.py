@@ -449,7 +449,16 @@ def send_prices_to_sheets(
         return {"appended": 0, "skipped": 0, "reason": "no rows"}
 
     if header is None:
-        header = ["sheet_row", "id", "acao", "product_name", "deflators", "new_price"]
+        header = [
+            "sheet_row",
+            "id",
+            "acao",
+            "product_name",
+            "deflators",
+            "last_price",
+            "last_created_at",
+            "new_price",
+        ]
 
     if service is None:
         service = _build_sheets_service()
@@ -516,12 +525,31 @@ def send_prices_to_sheets(
     if not filtered_rows:
         return {"appended": 0, "skipped": skipped, "reason": "all rows already present"}
 
+    def _serialize_value(value: object) -> object:
+        if value is None:
+            return ""
+        # Handle pandas Timestamp / datetime
+        try:
+            import pandas as _pd  # type: ignore
+
+            if isinstance(value, _pd.Timestamp):
+                if _pd.isna(value):
+                    return ""
+                return value.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+
+        if isinstance(value, datetime):
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+
+        return value
+
     # Build row values in header order.
     out_values: list[list[object]] = []
     for r in filtered_rows:
         row_vals: list[object] = []
         for col in header:
-            row_vals.append(r.get(col, ""))
+            row_vals.append(_serialize_value(r.get(col, "")))
         out_values.append(row_vals)
 
     append_resp = values.append(
@@ -539,5 +567,214 @@ def send_prices_to_sheets(
     }
 
 
-def calculate_new_price():
-    return
+
+def apply_price_curve(
+    *,
+    previous_price: float,
+    price_band: str,
+    price_status: str,
+    curve_spec: dict[str, object] | None = None,
+) -> float:
+    """Apply a piecewise-linear price curve based on band/status.
+
+    If price_status is "fair", returns previous_price unchanged.
+    """
+    if previous_price is None:
+        return -1.0
+
+    price = float(previous_price)
+
+    # Default curve points (x=previous_price, y=tweaked_price)
+    low_points = [
+        (10000, 10500),
+        (7000, 7350),
+        (5000, 5250),
+        (3000, 3200),
+        (2000, 2150),
+        (1500, 1600),
+        (1200, 1290),
+        (1000, 1080),
+        (800, 870),
+        (600, 660),
+        (400, 450),
+        (300, 340),
+        (200, 230),
+        (100, 120),
+    ]
+
+    high_points = [
+        (10000, 9750),
+        (7000, 6825),
+        (5000, 4875),
+        (3000, 2865),
+        (2000, 1910),
+        (1500, 1430),
+        (1200, 1160),
+        (1000, 950),
+        (800, 760),
+        (600, 560),
+        (400, 370),
+        (300, 280),
+        (200, 180),
+        (100, 80),
+    ]
+
+    if isinstance(curve_spec, dict):
+        low_points = curve_spec.get("low_points", low_points)  # type: ignore[assignment]
+        high_points = curve_spec.get("high_points", high_points)  # type: ignore[assignment]
+
+    def _interp(points: list[tuple[float, float]], x: float) -> float:
+        pts = sorted(points, key=lambda p: p[0])
+        if len(pts) < 2:
+            return x
+
+        # Clamp/extrapolate using the nearest segment.
+        if x <= pts[0][0]:
+            x1, y1 = pts[0]
+            x2, y2 = pts[1]
+        elif x >= pts[-1][0]:
+            x1, y1 = pts[-2]
+            x2, y2 = pts[-1]
+        else:
+            # Find segment containing x
+            for i in range(len(pts) - 1):
+                x1, y1 = pts[i]
+                x2, y2 = pts[i + 1]
+                if x1 <= x <= x2:
+                    break
+
+        if x2 == x1:
+            return y1
+        t = (x - x1) / (x2 - x1)
+        return y1 + t * (y2 - y1)
+
+    status = str(price_status).strip().lower()
+    if status == "low":
+        return float(_interp(low_points, price))
+    if status == "high":
+        return float(_interp(high_points, price))
+
+    # fair or unknown: keep previous price
+    return price
+
+
+def calculate_new_price_from_history(
+    *,
+    offer_rows: list[dict[str, object]],
+    bq_df: pd.DataFrame,
+    curve_spec: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
+    """Compute new prices using the most recent offer metrics per key.
+
+    Returns a list of row dicts including debug fields.
+    """
+    if bq_df.empty or not offer_rows:
+        # If no data, mark all rows as unmatched.
+        out: list[dict[str, object]] = []
+        for r in offer_rows:
+            row = dict(r)
+            row["new_price"] = -1
+            row["price_band"] = None
+            row["price_status"] = None
+            row["last_price"] = None
+            row["buy_clicks_after_release"] = None
+            out.append(row)
+        return out
+
+    df = bq_df.copy()
+    # Normalize types
+    df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+    df["seller_price"] = pd.to_numeric(df["seller_price"], errors="coerce")
+    if "buy_clicks_after_release" in df.columns:
+        df["buy_clicks_after_release"] = pd.to_numeric(
+            df["buy_clicks_after_release"], errors="coerce"
+        ).fillna(0)
+    else:
+        df["buy_clicks_after_release"] = 0
+
+    # Build lookup of historical offers per (product_name, deflators)
+    df = df.dropna(subset=["product_name", "deflators", "seller_price"])
+    df = df.sort_values(["product_name", "deflators", "created_at"], ascending=[True, True, False])
+
+    history_lookup: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for _, row in df.iterrows():
+        key = (str(row["product_name"]).strip(), str(row["deflators"]).strip())
+        history_lookup.setdefault(key, []).append(
+            {
+                "created_at": row["created_at"],
+                "seller_price": float(row["seller_price"]),
+                "buy_clicks_after_release": int(row["buy_clicks_after_release"]),
+            }
+        )
+
+    out_rows: list[dict[str, object]] = []
+
+    for r in offer_rows:
+        row = dict(r)
+        key = (str(row.get("product_name", "")).strip(), str(row.get("deflators", "")).strip())
+        history = history_lookup.get(key)
+        if not history:
+            row["new_price"] = -1
+            row["price_band"] = None
+            row["price_status"] = None
+            row["last_price"] = None
+            row["last_created_at"] = None
+            row["buy_clicks_after_release"] = None
+            row["price_history"] = []
+            out_rows.append(row)
+            continue
+
+        last = history[0]
+        last_price = float(last["seller_price"])
+        clicks = int(last.get("buy_clicks_after_release", 0))
+        last_created_at = last.get("created_at")
+
+        # Price band
+        if last_price >= 3000:
+            band = "expensive"
+        elif last_price >= 1500:
+            band = "mid"
+        else:
+            band = "cheap"
+
+        # Price status by clicks
+        if band == "expensive":
+            if clicks >= 3:
+                status = "low"
+            elif clicks == 2:
+                status = "fair"
+            else:
+                status = "high"
+        elif band == "mid":
+            if clicks >= 4:
+                status = "low"
+            elif clicks == 3:
+                status = "fair"
+            else:
+                status = "high"
+        else:
+            if clicks >= 5:
+                status = "low"
+            elif clicks in (3, 4):
+                status = "fair"
+            else:
+                status = "high"
+
+        new_price = apply_price_curve(
+            previous_price=last_price,
+            price_band=band,
+            price_status=status,
+            curve_spec=curve_spec,
+        )
+        new_price = int(round(new_price))
+
+        row["new_price"] = new_price
+        row["price_band"] = band
+        row["price_status"] = status
+        row["last_price"] = last_price
+        row["last_created_at"] = last_created_at
+        row["buy_clicks_after_release"] = clicks
+        row["price_history"] = history
+        out_rows.append(row)
+
+    return out_rows
